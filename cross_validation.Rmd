@@ -1,0 +1,247 @@
+---
+title: "Cross Validation"
+author: "Molly Martorella"
+date: "11/19/2019"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(modelr)
+library(mgcv)
+
+set.seed(1)
+```
+
+Create dataset:
+
+```{r}
+
+nonlin_df = 
+  tibble(
+    id = 1:100,
+    x = runif(100, 0, 1),
+    y = 1 - 10 * (x - .3) ^ 2 + rnorm(100, 0, .3)
+  )
+
+nonlin_df %>% 
+  ggplot(aes(x = x, y = y)) + 
+  geom_point() + theme_bw()
+
+```
+
+Training and testing:
+
+```{r}
+
+train_df = sample_n(nonlin_df, 80)
+test_df = anti_join(nonlin_df, train_df, by = "id")
+
+ggplot(train_df, aes(x = x, y = y)) + 
+  geom_point() + 
+  geom_point(data = test_df, color = "red")
+
+```
+
+Fit 3 models of varying goodness:
+
+```{r}
+
+linear_mod = lm(y ~ x, data = train_df)
+
+smooth_mod = mgcv::gam(y ~ s(x), data = train_df)
+
+wiggly_mod = mgcv::gam(y ~ s(x, k = 30), sp = 10e-6, data = train_df)
+
+```
+
+Look at fits:
+
+```{r}
+
+train_df %>% 
+  add_predictions(linear_mod) %>% 
+  ggplot(aes(x = x, y = y)) + geom_point() + 
+  geom_line(aes(y = pred), color = "red")
+
+train_df %>% 
+  add_predictions(smooth_mod) %>% 
+  ggplot(aes(x = x, y = y)) + geom_point() + 
+  geom_line(aes(y = pred), color = "red")
+
+train_df %>% 
+  add_predictions(wiggly_mod) %>% 
+  ggplot(aes(x = x, y = y)) + geom_point() + 
+  geom_line(aes(y = pred), color = "red")
+
+
+train_df %>% 
+  gather_predictions(linear_mod, smooth_mod, wiggly_mod) %>% 
+  mutate(model = fct_inorder(model)) %>% 
+  ggplot(aes(x = x, y = y)) + 
+  geom_point() + 
+  geom_line(aes(y = pred), color = "red") + 
+  facet_wrap(~model)
+
+```
+
+
+Calculate rmse:
+
+```{r}
+rmse(linear_mod, test_df)
+
+rmse(smooth_mod, test_df)
+
+rmse(wiggly_mod, test_df)
+
+##larger numbers are worse
+
+```
+
+## Modelr
+
+Cross validation using modelr (make predictions on datset, and calculate root mean squared error):
+
+crossv_mc is function within modelr to use - it generates test/training pairs from a dataframe. By default will do 80/20 split, and can tell it to repeat that process however many times (below it is repeated 100 times).
+
+```{r}
+
+cv_df = 
+  crossv_mc(nonlin_df, 100) 
+
+```
+
+Generate training and testing dataset:
+
+```{r}
+
+cv_df %>% pull(train) %>% .[[1]] %>% as_tibble
+
+cv_df %>% pull(test) %>% .[[1]] %>% as_tibble
+
+#need to convert to dataframe because currently stored as less memory intensive objects:
+
+cv_df =
+  cv_df %>% 
+  mutate(
+    train = map(train, as_tibble),
+    test = map(test, as_tibble))
+
+```
+
+Fit models, then calculate rmse for linear mo:
+
+```{r}
+
+cv_df = 
+  cv_df %>% 
+  mutate(linear_mod  = map(.x = train, ~lm(y ~ x, data = .x)),
+         smooth_mod  = map(train, ~mgcv::gam(y ~ s(x), data = .x)),
+         wiggly_mod  = map(train, ~gam(y ~ s(x, k = 30), sp = 10e-6, data = .x))) %>% 
+  mutate(rmse_linear = map2_dbl(.x = linear_mod, .y = test, ~rmse(model = .x, data = .y)),
+         rmse_smooth = map2_dbl(smooth_mod, test, ~rmse(model = .x, data = .y)),
+         rmse_wiggly = map2_dbl(wiggly_mod, test, ~rmse(model = .x, data = .y)))
+
+#map2 - map over 2 things. Need both model created and testing data set to map over. (2 inputs vs map which only allows for one input). map2_dbl clarifies that it's a number so you don't have to tidy/modify that column later on.
+
+```
+
+
+Plot of RMSE value distribution for each model:
+
+
+```{r}
+
+cv_df %>% 
+  select(starts_with("rmse")) %>% 
+  pivot_longer(
+    everything(),
+    names_to = "model", 
+    values_to = "rmse",
+    names_prefix = "rmse_") %>% 
+  mutate(model = fct_inorder(model)) %>% 
+  ggplot(aes(x = model, y = rmse)) + geom_violin()
+
+```
+
+### Child growth example
+
+```{r}
+
+child_growth = read_csv("./data/nepalese_children.csv")
+
+child_growth %>% 
+  ggplot(aes(x = weight, y = armc)) + 
+  geom_point(alpha = .5)
+
+```
+
+
+```{r}
+child_growth =
+  child_growth %>% 
+  mutate(weight_cp = (weight > 7) * (weight - 7))
+```
+
+
+```{r}
+linear_mod = lm(armc ~ weight, data = child_growth)
+pwl_mod = lm(armc ~ weight + weight_cp, data = child_growth)
+smooth_mod = gam(armc ~ s(weight), data = child_growth)
+
+#pwl --> piecewise linear model. Pick where changepoint happens (chose 7 here).
+```
+
+
+```{r}
+child_growth %>% 
+  gather_predictions(linear_mod, pwl_mod, smooth_mod) %>% 
+  mutate(model = fct_inorder(model)) %>% 
+  ggplot(aes(x = weight, y = armc)) + 
+  geom_point(alpha = .5) +
+  geom_line(aes(y = pred), color = "red") + 
+  facet_grid(~model)
+```
+
+```{r}
+cv_df =
+  crossv_mc(child_growth, 100) %>% 
+  mutate(
+    train = map(train, as_tibble),
+    test = map(test, as_tibble))
+
+```
+
+
+```{r}
+cv_df = 
+  cv_df %>% 
+  mutate(linear_mod  = map(train, ~lm(armc ~ weight, data = .x)),
+         pwl_mod     = map(train, ~lm(armc ~ weight + weight_cp, data = .x)),
+         smooth_mod  = map(train, ~gam(armc ~ s(weight), data = as_tibble(.x)))) %>% 
+  mutate(rmse_linear = map2_dbl(linear_mod, test, ~rmse(model = .x, data = .y)),
+         rmse_pwl    = map2_dbl(pwl_mod, test, ~rmse(model = .x, data = .y)),
+         rmse_smooth = map2_dbl(smooth_mod, test, ~rmse(model = .x, data = .y)))
+```
+
+
+```{r}
+cv_df %>% 
+  select(starts_with("rmse")) %>% 
+pivot_longer(
+    everything(),
+    names_to = "model", 
+    values_to = "rmse",
+    names_prefix = "rmse_") %>% 
+  mutate(model = fct_inorder(model)) %>% 
+  ggplot(aes(x = model, y = rmse)) + geom_violin()
+
+
+#smooth looks better, but often will choose pwl because the interpretation is readily apparent.
+```
+
+
+
